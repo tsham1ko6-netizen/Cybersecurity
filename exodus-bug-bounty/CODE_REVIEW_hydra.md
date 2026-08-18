@@ -109,29 +109,62 @@ content-script bridge over `window.postMessage`
   product itself is explicitly out of scope per the program's excluded-assets list) — so this line of inquiry
   is now blocked on code this session can't reach, not on effort spent.
 
+**`hydra/adapters/storage-encrypted`**, **`browser-extension-adapters/encrypted-storage`**, and the
+**`seco-rw`/`seco-file`** chain — storage-layer key management
+Traced key provenance end-to-end: `sdks/headless/src/unlock-encrypted-storage.js` derives the
+`storage-encrypted` key from the already-unlocked wallet seed (`EXODUS_KEY_IDS.WALLET_INFO` via
+`cachedSodiumEncryptor`) — this store holds wallet-info metadata, not the raw seed. Passphrase/key never
+appears in a log call anywhere in this chain. One concrete, if low-impact, observation moved to
+`FINDINGS.md` #2: `swallowDecryptionErrors` defaults to `true` in the browser-extension adapter, so an
+undecryptable value silently becomes `undefined` instead of throwing — capped in severity since it doesn't
+touch seed material and requires local write access (`seco-rw`/`seco-file` sit *underneath* this, wrapping
+`secure-container` directly, and correctly fail closed with no such swallowing).
+
+**`hydra/features/keychain/module/crypto/*.js`** — every per-curve signing implementation
+`secp256k1.js` (ECDSA + BIP340-ish Schnorr + a custom "SchnorrZ" scheme for Zilliqa), `ed25519.js`, `sodium.js`
+(box/secretbox/sealed-box wrappers), `cardano.js` (Byron-era V1 key derivation with the correct clamping-bit
+rejection loop, matching the reference `cardano-wallet` spec). All delegate actual signing math to
+`@exodus/crypto`/`@noble/secp256k1`/libsodium rather than reimplementing curve arithmetic. The one homegrown
+piece is `schnorr-z.js`'s nonce generator (`singleRoundHmacDRBG`): unlike RFC 6979 it does **not** mix the
+private key into the HMAC-DRBG state, relying entirely on a fresh `randomBytes(32)` per call for nonce
+uniqueness instead of pure determinism. Given `randomBytes` is confirmed CSPRNG-backed (see the `crypto` repo
+section above), this shouldn't practically produce nonce reuse, but it does forgo the defense-in-depth RFC 6979
+normally provides against a degraded RNG — a hardening note, not a demonstrated exploit, so not written up as
+a standalone finding.
+
+**`hydra/features/address-provider`** and **`@exodus/asset-lib`** (pulled from npm, v5.9.2 — not vendored in
+`hydra`) — address/account derivation orchestration
+`address-provider.js` handles caching, purpose resolution, and multisig-vs-singlesig branching, but the actual
+per-asset choice of derivation path (`getDefaultAddressPath`/`getKeyIdentifier`, i.e. which coin type/purpose
+maps to which asset) is delegated to `baseAsset.api`, which resolves to config defined in **individual
+per-asset packages** (e.g. whatever provides Bitcoin's vs. Ethereum's vs. Solana's `api` object) — those
+aren't in `hydra` or in `@exodus/asset-lib` (confirmed by pulling and reading it: `getDefaultPathIndexes` in
+`asset-lib/src/address-path.js` is itself just a two-line dispatcher to `baseAsset.api.getDefaultAddressPath`).
+This is a dead end for a "wrong coin's derivation path used" bug without those per-asset packages, which this
+session doesn't have a name or location for.
+
 ## Not yet reviewed (good next targets, roughly in priority order)
 
-1. `hydra/adapters/storage-encrypted`, `hydra/libraries/seco-file` / `seco-keyval` / `seco-rw` — storage layer
-   built on top of `secure-container`; check key management (where does the encryption key/passphrase actually
-   come from, is it ever logged or held in a way another process/extension could read)
-2. `hydra/features/keychain/module/crypto/*.js` (ed25519.js, secp256k1.js, sodium.js, cardano.js, schnorr-z.js) —
-   read the dispatch/glue in `keychain.js`, but not yet the per-curve signing implementations themselves
-3. npm packages `@exodus/keychain`, `@exodus/safe-string`, `@exodus/errors`, `@exodus/sentry-client` (listed
+1. Individual per-asset plugin packages (whatever provides `baseAsset.api.getDefaultAddressPath` /
+   `getKeyIdentifier` for a specific coin) — highest remaining severity ceiling (wrong derivation path/coin-type
+   mixing), but this session doesn't know their package names/locations; if you have one, hand it over directly
+2. npm packages `@exodus/keychain`, `@exodus/safe-string`, `@exodus/errors`, `@exodus/sentry-client` (listed
    individually in scope) — not yet pulled; worth diffing their published npm tarball against what ships in
    `hydra` in case an older/patched version is what's actually distributed
-4. `hydra/features/wallet-accounts`, `hydra/features/address-provider` — where addresses/accounts get computed;
-   a bug here (wrong account derivation, address reuse across assets) would be high severity but is a large surface
+3. `hydra/features/wallet-accounts` — account creation/enumeration logic specifically (address-provider only
+   covers per-address derivation, not account-level state)
 
 ## Status
 
-No exploitable vulnerability found after this pass across crypto primitives, encoding, the on-disk encrypted
-container format, sodium wrapper, BIP39/BIP32/SLIP10 derivation, derivation-path validation, the in-memory
-keychain's lock/unlock and signing gate, and the full postMessage → content-script → background transport
-chain (`window-rpc-transport` + `browser-extension-channels` + `browser-extension-rpc`). This tracks with a
-codebase that runs CodeQL plus AI-assisted review (Codex + Copilot) on every PR — the "easy" bugs in core
-crypto and transport plumbing are unlikely to still be there. The transport-layer investigation is now blocked
-on code that isn't public (the actual permission-check business logic in the extension's background script),
-not on remaining effort. The remaining open items above are lower-probability but still-unreviewed surface.
+No exploitable vulnerability found after four passes covering crypto primitives, encoding, the on-disk
+encrypted container format, sodium wrapper, BIP39/BIP32/SLIP10 derivation, derivation-path validation, the
+in-memory keychain's lock/unlock and every per-curve signing implementation, the full postMessage →
+content-script → background transport chain, storage-layer key provenance, and address/account derivation
+orchestration. This tracks with a codebase that runs CodeQL plus AI-assisted review (Codex + Copilot) on every
+PR. Two candidate findings worth Exodus's own confirmation are in `FINDINGS.md` (Android keystore security
+tier default; the swallowed-decryption-error case, deprioritized). Remaining leads (transport-layer
+business logic, per-asset derivation config) are blocked on source this session cannot reach — not on
+further review effort against what's actually available.
 
 ## How to continue
 
