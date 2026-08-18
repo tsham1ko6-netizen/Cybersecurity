@@ -43,24 +43,70 @@ postMessage/extension-transport origin verification lives in an external depende
 in this repo, so it wasn't reviewable here. **This is the single highest-value place left to check** for a
 malicious-website-signs-without-consent bug class, but it's outside the cloned source.
 
+**`hydra/libraries/bip39`** (`src/index.js`) — mnemonic generation/validation
+`generateMnemonic` restricts `bitsize` to the standard set {128,160,192,224,256} and pulls entropy from the
+same CSPRNG-backed `randomBytes`. `mnemonicToEntropy` recomputes and asserts the SHA-256 checksum bits before
+accepting a mnemonic — no bypass path found (a mnemonic with a forged checksum throws). Entropy buffers are
+`.fill(0)`'d on the error/return paths that convert to hex/buffer, limiting how long derived entropy sits in
+memory.
+
+**`hydra/libraries/bip32`** (`src/hdkey.js`) and **`hydra/libraries/slip10`** (`src/hdkey.js`) — HD derivation
+Standard BIP32 child-key derivation (`CKDpriv`/`CKDpub`), correctly retries `deriveChild(index + 1)` on the
+`IL >= n` / point-at-infinity edge case per spec instead of silently producing a bad key. SLIP10 (ed25519,
+hardened-only) matches the reference spec, including hashing the seed through `"ed25519 seed"` before
+derivation so the same seed bytes can't be reused directly as secp256k1 material. `HDKey#derive(path)` path
+parsing rejects indices `>= HARDENED_OFFSET` and a malformed negative index fails closed (`Buffer.writeUInt32BE`
+throws on negative input) rather than silently deriving the wrong key.
+
+**`hydra/libraries/key-utils/src/derivation-path.js`** — path validation
+Explicitly defends against the known real-world BIP32 footgun (an unhardened child derived after a hardened
+one, which combined with an xpub leak can expose the parent xpriv): `assertValidDerivationPath` and the
+`DerivationPath` class both reject "hardened index after unhardened index" paths. Also guards against the
+"`m/0'somestring`" style injection that a naive regex without `^$` anchors would accept (`bip32-path`'s own
+regex doesn't anchor; this library re-validates on top of it).
+
+**`hydra/features/keychain/module/keychain.js`** — the actual in-memory key store used for signing
+Lock/unlock semantics: `#getPrivateHDKey` only skips the "are private keys unlocked" check when called with
+an internal `Symbol` that isn't reachable from outside the class. The ed25519/secp256k1/sodium/cardano signer
+sub-modules are handed the bound method but can't produce that symbol, so every actual **signing** path
+(`signBuffer` → `secp256k1.signBuffer`/`ed25519.signBuffer`/etc.) enforces the lock. `exportKey`/`getPublicKey`
+intentionally bypass the lock for *public*-key-only derivation (needed to show balances/addresses while
+locked) — that's a deliberate, sane design, not a leak: `exportKey` still gates `exportPrivate` behind
+`#assertPrivateKeysUnlocked`. No path found where `signBuffer` succeeds while a seed is locked.
+
+**`hydra/adapters/storage-unsafe-desktop`** — plain, unencrypted `fs`-backed key/value storage
+This is intentionally unencrypted by design (its own README says so up front: "'Unsafe' = no encryption out
+of the box"), meant to be composed with `secure-container`/`storage-encrypted` for anything sensitive. Nothing
+in this adapter itself mishandles secrets — whether it's *wired up* correctly (i.e., never handed a seed/
+private key directly by some SDK config) would require seeing actual app-level dependency injection config,
+which isn't in this repo.
+
 ## Not yet reviewed (good next targets, roughly in priority order)
 
-1. `hydra/libraries/bip39`, `bip32`, `slip10`, `key-utils`, `key-identifier` — seed/key derivation correctness
-   (wrong derivation path handling, mixing coin types, off-by-one in hardened-index logic would be critical-severity)
-2. `hydra/features/keychain`, `hydra/features/tx-signer`, `hydra/features/message-signer` — where user consent
-   is actually gated before a signature is produced; look for any path that signs without the confirmation step,
-   or where a crafted RPC payload could get auto-approved via `isAutoApprove`
-3. `hydra/adapters/storage-unsafe-desktop` — name implies weaker guarantees; worth confirming it's never used
-   for secret material (seed/private keys) and only for genuinely non-sensitive data
-4. `hydra/adapters/storage-encrypted`, `hydra/libraries/seco-file` / `seco-keyval` / `seco-rw` — storage layer
+1. `hydra/adapters/storage-encrypted`, `hydra/libraries/seco-file` / `seco-keyval` / `seco-rw` — storage layer
    built on top of `secure-container`; check key management (where does the encryption key/passphrase actually
    come from, is it ever logged or held in a way another process/extension could read)
-5. `hydra/libraries/browser-extension-channels`, `browser-extension-rpc` (background/content/inapp bridges) —
-   re-check once/if `@exodus/window-rpc-transport` source is available, since that's where origin checks for
-   `postMessage` would live
-6. npm packages `@exodus/keychain`, `@exodus/safe-string`, `@exodus/errors`, `@exodus/sentry-client` (listed
+2. `hydra/libraries/browser-extension-channels`, `browser-extension-rpc` (background/content/inapp bridges) —
+   the actual `postMessage` origin check lives in `@exodus/window-rpc-transport`, an external dependency not
+   vendored into this workspace, so it couldn't be reviewed here — still the single highest-value unreviewed
+   spot for a "malicious site signs without consent" bug class
+3. `hydra/features/keychain/module/crypto/*.js` (ed25519.js, secp256k1.js, sodium.js, cardano.js, schnorr-z.js) —
+   read the dispatch/glue in `keychain.js`, but not yet the per-curve signing implementations themselves
+4. npm packages `@exodus/keychain`, `@exodus/safe-string`, `@exodus/errors`, `@exodus/sentry-client` (listed
    individually in scope) — not yet pulled; worth diffing their published npm tarball against what ships in
    `hydra` in case an older/patched version is what's actually distributed
+5. `hydra/features/wallet-accounts`, `hydra/features/address-provider` — where addresses/accounts get computed;
+   a bug here (wrong account derivation, address reuse across assets) would be high severity but is a large surface
+
+## Status
+
+No exploitable vulnerability found after this pass across crypto primitives, encoding, the on-disk encrypted
+container format, sodium wrapper, BIP39/BIP32/SLIP10 derivation, derivation-path validation, and the in-memory
+keychain's lock/unlock and signing gate. This tracks with a codebase that runs CodeQL plus AI-assisted review
+(Codex + Copilot) on every PR — the "easy" bugs in core crypto are unlikely to still be there. The remaining
+open items above (especially #2, the postMessage/RPC origin-check boundary) are where a real finding is most
+likely to still be sitting, but reviewing them needs source this session doesn't have access to, or is a much
+larger surface (#5) that needs more budget than one pass.
 
 ## How to continue
 
