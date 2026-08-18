@@ -81,32 +81,57 @@ in this adapter itself mishandles secrets — whether it's *wired up* correctly 
 private key directly by some SDK config) would require seeing actual app-level dependency injection config,
 which isn't in this repo.
 
+**`@exodus/window-rpc-transport`** (pulled from the npm registry directly, `registry.npmjs.org` — v1.1.1;
+not vendored in the `hydra` workspace, so this required fetching it separately) — the inpage-provider ↔
+content-script bridge over `window.postMessage`
+- `WindowTransport#isValidEvent` gates on `event.origin === window.location.origin`. This looks odd at first
+  (it accepts *any* same-origin sender, including the dApp page's own JS, not just "the real content script")
+  but that's the correct and standard design for this bridge: content script and inpage script share the same
+  origin/window by construction (isolated vs main world of the *same* tab), and the dApp page is *supposed* to
+  be able to initiate RPC requests this way — that's the entire point of an injected wallet provider. This is
+  not itself a security boundary; it only filters out messages injected from a different frame/origin.
+- `MultiplexTransport#isValidEvent` (`event.target === this.name`) is pure channel routing, also not a security
+  boundary — a page script could forge a `target` field to address a different internal channel, but it still
+  can't escape being "just a same-origin page script," which is the trust level this layer accepts by design.
+- The real access-control boundary has to be one layer further in: **`browser-extension-channels/channel.js`**,
+  where `chrome.runtime.onMessage`'s `sender` object (browser-populated, `sender.origin`/`sender.url`/`sender.tab`
+  — not spoofable by page or content-script JS) is what any origin-based permission check (e.g., "is this in
+  `connectedOrigins` and trusted?") would have to rely on. The channel code does correctly preserve and pass
+  through that trustworthy `sender` object to callbacks in both `onMessage` and `onCall`. One thing worth noting:
+  it also grafts `sender.metadata = message.senderMetadata` onto it, where `senderMetadata` (site title/icon,
+  computed in `content.js` from `document.title`/favicon) is fully attacker/page-controlled — if any UI trusts
+  `sender.metadata.title` for display without also showing the real `sender.origin`, that's a spoofable "site
+  name" in a connection-approval prompt (low-severity UI trust issue, not a signing bypass, and I can't confirm
+  whether the actual approval UI does this since that UI code isn't in this repo).
+- Bottom line: nothing exploitable found in the transport plumbing itself. Whether the *application* actually
+  performs the origin check using `sender.origin` before approving a connection/signature is decided in
+  background-script business logic that isn't part of the public `hydra` mirror (the Exodus Browser Extension
+  product itself is explicitly out of scope per the program's excluded-assets list) — so this line of inquiry
+  is now blocked on code this session can't reach, not on effort spent.
+
 ## Not yet reviewed (good next targets, roughly in priority order)
 
 1. `hydra/adapters/storage-encrypted`, `hydra/libraries/seco-file` / `seco-keyval` / `seco-rw` — storage layer
    built on top of `secure-container`; check key management (where does the encryption key/passphrase actually
    come from, is it ever logged or held in a way another process/extension could read)
-2. `hydra/libraries/browser-extension-channels`, `browser-extension-rpc` (background/content/inapp bridges) —
-   the actual `postMessage` origin check lives in `@exodus/window-rpc-transport`, an external dependency not
-   vendored into this workspace, so it couldn't be reviewed here — still the single highest-value unreviewed
-   spot for a "malicious site signs without consent" bug class
-3. `hydra/features/keychain/module/crypto/*.js` (ed25519.js, secp256k1.js, sodium.js, cardano.js, schnorr-z.js) —
+2. `hydra/features/keychain/module/crypto/*.js` (ed25519.js, secp256k1.js, sodium.js, cardano.js, schnorr-z.js) —
    read the dispatch/glue in `keychain.js`, but not yet the per-curve signing implementations themselves
-4. npm packages `@exodus/keychain`, `@exodus/safe-string`, `@exodus/errors`, `@exodus/sentry-client` (listed
+3. npm packages `@exodus/keychain`, `@exodus/safe-string`, `@exodus/errors`, `@exodus/sentry-client` (listed
    individually in scope) — not yet pulled; worth diffing their published npm tarball against what ships in
    `hydra` in case an older/patched version is what's actually distributed
-5. `hydra/features/wallet-accounts`, `hydra/features/address-provider` — where addresses/accounts get computed;
+4. `hydra/features/wallet-accounts`, `hydra/features/address-provider` — where addresses/accounts get computed;
    a bug here (wrong account derivation, address reuse across assets) would be high severity but is a large surface
 
 ## Status
 
 No exploitable vulnerability found after this pass across crypto primitives, encoding, the on-disk encrypted
-container format, sodium wrapper, BIP39/BIP32/SLIP10 derivation, derivation-path validation, and the in-memory
-keychain's lock/unlock and signing gate. This tracks with a codebase that runs CodeQL plus AI-assisted review
-(Codex + Copilot) on every PR — the "easy" bugs in core crypto are unlikely to still be there. The remaining
-open items above (especially #2, the postMessage/RPC origin-check boundary) are where a real finding is most
-likely to still be sitting, but reviewing them needs source this session doesn't have access to, or is a much
-larger surface (#5) that needs more budget than one pass.
+container format, sodium wrapper, BIP39/BIP32/SLIP10 derivation, derivation-path validation, the in-memory
+keychain's lock/unlock and signing gate, and the full postMessage → content-script → background transport
+chain (`window-rpc-transport` + `browser-extension-channels` + `browser-extension-rpc`). This tracks with a
+codebase that runs CodeQL plus AI-assisted review (Codex + Copilot) on every PR — the "easy" bugs in core
+crypto and transport plumbing are unlikely to still be there. The transport-layer investigation is now blocked
+on code that isn't public (the actual permission-check business logic in the extension's background script),
+not on remaining effort. The remaining open items above are lower-probability but still-unreviewed surface.
 
 ## How to continue
 
