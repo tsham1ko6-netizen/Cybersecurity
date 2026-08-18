@@ -6,7 +6,68 @@ caveats before submitting anything from here.
 
 ---
 
+## 0. `@exodus/keychain@12.0.0` does not enforce its own documented seed-switch protection
+
+**Status**: HackerOne's automated pre-submission check rejected finding #1 (below) as "Lack of SSL
+Pinning"-category — a hardening issue requiring a compromised device, not directly exploitable. This finding
+is different in kind: it requires no device compromise, no root, nothing beyond calling a public library
+method twice — pure application-logic. Submit this one.
+
+**File**: `github.com/ExodusOSS/hydra`, `features/keychain/module/keychain.js` (also published standalone as
+`@exodus/keychain` on npm — this finding is against npm's **latest published version, 12.0.0**, installed and
+executed for real, not against a stale mirror)
+**PoC**: `poc/keychain-silent-seed-switch.mjs` (`npm install @exodus/keychain@12.0.0 && node
+keychain-silent-seed-switch.mjs` — installs and runs the actual published package, no mocks)
+
+### What the code does vs. what it documents
+
+`@exodus/keychain`'s own CHANGELOG, under the v12.0.0 breaking-change entry, states:
+
+> Unlocking a different seed without an intervening `lock()` now throws.
+
+The actual shipped `unlock()` method does not implement this. It's wrapped in `restrictConcurrency`
+(`make-concurrent`), which only serializes concurrent calls — it does not compare the seed across sequential
+calls. Calling `unlock(seedA)` then `unlock(seedB)` (different seed, no `lock()` in between) does not throw:
+it silently drops seed A's derived key material and replaces it with seed B's, with zero signal that a switch
+happened.
+
+### Reproduction (ran against the real package)
+
+```
+unlocked seed A, seedId: 824b7607898267b0ee177e293ba39753857e73d2
+isLocked after unlock A: false
+unlock(seedB) did NOT throw. seedId: c03af2465953de9a2276c0c2219be1d4b2ed6134
+This contradicts the CHANGELOG-documented breaking change for v12.0.0.
+seed A no longer usable after silent switch to B: seed with id "824b7607898267b0ee177e293ba39753857e73d2" is not initialized
+```
+
+### Impact and honest caveats
+
+The documented guarantee exists specifically so that application code integrating this library can rely on
+"switching which seed is active always requires an explicit `lock()` first, or it throws" as a safety net
+against accidentally operating on the wrong seed (stale session state, a bug in a multi-profile/account-switch
+flow, etc.). That safety net does not exist. I can't point to a specific exploited call site in the actual
+Exodus apps (those callers are in private repos), so I can't prove a concrete "attacker forces this" chain —
+but that's true of most missing-invariant bugs reported at the library level, and the mismatch between
+documented and actual behavior is unambiguous and 100% reproducible with no special access. This is
+substantially stronger footing than finding #1: no rooted/compromised device is needed anywhere in this
+chain, and both the repo (`hydra`) and the npm package (`@exodus/keychain`) are named directly in the
+program's scope table.
+
+### Suggested fix
+
+Either implement the assertion the CHANGELOG already promises (throw in `unlock()` if a different, non-external
+seed is already active and `lock()` wasn't called first), or correct the CHANGELOG/README to stop claiming a
+guarantee that isn't enforced — currently a consumer of this library has no way to know from the code alone
+that the protection is missing.
+
+---
+
 ## 1. `@exodus/keystore-mobile` defaults Android secret storage to `SECURE_SOFTWARE`, not `SECURE_HARDWARE`
+
+**Status**: rejected by HackerOne's automated pre-submission check ("Lack of SSL Pinning" category — requires
+a compromised/rooted device, describes hardening not a directly exploitable vulnerability). Not submitted.
+Keeping the writeup below for reference.
 
 **File**: `hydra/adapters/keystore-mobile/src/index.js`, lines 16–22
 **Repo**: `github.com/ExodusOSS/hydra` (explicitly in scope)
